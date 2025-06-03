@@ -1,0 +1,1040 @@
+marginfi flashloan:
+
+const { Connection, PublicKey, Keypair, SystemProgram, VersionedTransaction, TransactionMessage, LAMPORTS_PER_SOL, TransactionInstruction, ComputeBudgetProgram } = require('@solana/web3.js');
+const axios = require('axios');
+const bs58 = require('bs58');
+const { MarginfiClient, getConfig, MarginfiAccountWrapper } = require('@mrgnlabs/marginfi-client-v2');
+const { NodeWallet } = require('@mrgnlabs/mrgn-common');
+const { createAssociatedTokenAccountInstruction, getAssociatedTokenAddress: getSplAssociatedTokenAddress } = require('@solana/spl-token');
+
+// Configuration
+const privateKey = 'your private keys';
+const wallet = Keypair.fromSecretKey(bs58.decode(privateKey));
+if (wallet.publicKey.toBase58() !== 'your wallet address') {
+  throw new Error('Private key does not match expected public key 2kLGTn9a9Zaw7rx3KNs3e6evUJNbB3BLFh99zAeRbja3');
+}
+const QUICKNODE_RPC_PRIMARY = 'https://empty-small-card.solana-mainnet.quiknode.pro/ff5ad860c5e0daf0a6fdcf039c8638b4fcffc927/';
+const QUICKNODE_RPC_SECONDARY = 'https://api.mainnet-beta.solana.com';
+let currentRpc = QUICKNODE_RPC_PRIMARY;
+let connection = new Connection(currentRpc, 'confirmed');
+
+// Pre-created MarginFi account
+const MARGINFI_ACCOUNT_ADDRESS = new PublicKey('H13bJTWt6xa14yVFFN7x39PLB5aMq78heCjppR72Vfwb');
+const MARGINFI_GROUP_ADDRESS = new PublicKey('4qp6Fx6tnZkY5Wropq9wUYgtFxXKwE6viZxFHg3rdAG8');
+
+// Token Definitions
+const SOL = new PublicKey('So11111111111111111111111111111111111111112');
+const USDC = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+const USDT = new PublicKey('Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB');
+const MARGINFI_PROGRAM_ID = new PublicKey('MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA');
+const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const SYSVAR_INSTRUCTIONS = new PublicKey('Sysvar1nstructions1111111111111111111111111');
+
+// Discriminators
+function getStartFlashDiscriminator() {
+  return Buffer.from([14, 131, 33, 220, 81, 186, 180, 107]);
+}
+
+function getBorrowDiscriminator() {
+  return Buffer.from([4, 126, 116, 53, 48, 5, 212, 31]);
+}
+
+function getRepayDiscriminator() {
+  return Buffer.from([79, 209, 172, 177, 222, 51, 173, 151]);
+}
+
+function getEndFlashDiscriminator() {
+  return Buffer.from([105, 124, 201, 106, 153, 2, 8, 156]);
+}
+
+// Sleep function
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Switch RPC
+function switchRpc() {
+  currentRpc = (currentRpc === QUICKNODE_RPC_PRIMARY) ? QUICKNODE_RPC_SECONDARY : QUICKNODE_RPC_PRIMARY;
+  connection = new Connection(currentRpc, 'confirmed');
+  console.log(`Switched to RPC: ${currentRpc}`);
+}
+
+// Jupiter Quote Fetching with Dynamic Slippage
+async function getJupiterQuote(inputMint, outputMint, amount, maxAttempts = 3, initialSlippageBps = 25) {
+  let slippageBps = initialSlippageBps;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const url = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&directRoutesOnly=false`;
+    console.log(`Fetching quote (Attempt ${attempt}/${maxAttempts}) from: ${url}`);
+    try {
+      const response = await axios.get(url);
+      console.log(`Quote response:`, response.data);
+      if (!response.data.outAmount) throw new Error('Invalid quote response: outAmount missing');
+      return { ...response.data, slippageBps };
+    } catch (error) {
+      if (attempt === maxAttempts) throw new Error(`Jupiter API error after ${maxAttempts} attempts: ${error.message} - Status: ${error.response?.status}`);
+      console.warn(`Quote failed, increasing slippage to ${slippageBps * 1.5} bps and retrying...`);
+      slippageBps = Math.min(Math.floor(slippageBps * 1.5), 1000);
+      await sleep(1000);
+    }
+  }
+}
+
+// Jupiter Swap Execution
+async function executeJupiterSwap(quoteResponse) {
+  const swapUrl = 'https://quote-api.jup.ag/v6/swap';
+  console.log(`Executing swap with quoteResponse:`, quoteResponse);
+  try {
+    const { data } = await axios.post(swapUrl, {
+      quoteResponse,
+      userPublicKey: wallet.publicKey.toString(),
+      wrapAndUnwrapSol: true,
+    });
+
+    const swapTransaction = VersionedTransaction.deserialize(Buffer.from(data.swapTransaction, 'base64'));
+    swapTransaction.sign([wallet]);
+
+    const message = swapTransaction.message;
+    const instructions = [];
+    const addressLookupTableAccounts = [];
+
+    if (message.addressTableLookups && message.addressTableLookups.length > 0) {
+      console.log('Resolving address lookup tables...');
+      const lutAddresses = message.addressTableLookups.map(lut => new PublicKey(lut.accountKey));
+      const lutAccounts = await connection.getMultipleAccountsInfo(lutAddresses);
+      for (let i = 0; i < lutAccounts.length; i++) {
+        if (lutAccounts[i] && lutAccounts[i].data) {
+          const accountData = lutAccounts[i].data;
+          const bufferLength = accountData.length;
+          console.log(`LUT ${lutAddresses[i].toBase58()} buffer length: ${bufferLength} bytes`);
+
+          if (bufferLength < 9) {
+            console.warn(`Invalid LUT data length (${bufferLength} bytes) for ${lutAddresses[i].toBase58()}, skipping`);
+            continue;
+          }
+
+          const state = accountData.readUInt8(0);
+          const deactivationSlot = accountData.readBigUInt64LE(1);
+          const addressCount = Math.floor((bufferLength - 9) / 32);
+          const addresses = [];
+          for (let j = 0; j < addressCount; j++) {
+            const start = 9 + (j * 32);
+            const end = start + 32;
+            if (end <= bufferLength) {
+              const pubkeyData = accountData.slice(start, end);
+              addresses.push(new PublicKey(pubkeyData));
+            }
+          }
+          addressLookupTableAccounts.push({ key: lutAddresses[i], state, deactivationSlot, addresses });
+          console.log(`LUT ${lutAddresses[i].toBase58()} resolved with ${addresses.length} addresses`);
+        } else {
+          console.warn(`Failed to fetch LUT account: ${lutAddresses[i].toBase58()}`);
+        }
+      }
+    }
+
+    const allAccountKeys = [...message.staticAccountKeys];
+    console.log('All static account keys:', allAccountKeys.map(key => key.toBase58()));
+    if (addressLookupTableAccounts.length > 0) {
+      message.addressTableLookups.forEach(lut => {
+        const lookupTable = addressLookupTableAccounts.find(acc => acc.key.equals(lut.accountKey));
+        if (lookupTable) {
+          const indexes = [...lut.writableIndexes, ...lut.readonlyIndexes];
+          indexes.forEach(index => {
+            if (index < lookupTable.addresses.length) {
+              const pubkey = lookupTable.addresses[index];
+              if (pubkey) allAccountKeys.push(pubkey);
+              else console.warn(`Missing pubkey at index ${index} in LUT ${lut.accountKey.toBase58()}`);
+            } else {
+              console.warn(`Index ${index} out of bounds for LUT ${lut.accountKey.toBase58()}`);
+            }
+          });
+        }
+      });
+    }
+    console.log('All account keys after LUT resolution:', allAccountKeys.map(key => key.toBase58()));
+
+    if (message.compiledInstructions) {
+      for (const compiledIx of message.compiledInstructions) {
+        const programIdIndex = compiledIx.programIdIndex;
+        let programId = allAccountKeys[programIdIndex];
+        if (!programId) {
+          console.warn(`Skipping instruction due to undefined programId at index ${programIdIndex}`);
+          continue;
+        }
+
+        if (programId.equals(SystemProgram.programId) && compiledIx.data.length === 8 && compiledIx.data.readUInt32LE(0) === 2) {
+          programId = ComputeBudgetProgram.programId;
+          console.log(`Corrected program ID to ComputeBudget111111111111111111111111111111 for instruction with data ${compiledIx.data.toString('hex')}`);
+        }
+
+        const accounts = compiledIx.accountKeyIndexes.map(idx => {
+          const pubkey = allAccountKeys[idx];
+          if (!pubkey) {
+            console.warn(`Skipping account at index ${idx} due to undefined pubkey`);
+            return null;
+          }
+          return { pubkey, isSigner: message.isAccountSigner(idx), isWritable: message.isAccountWritable(idx) };
+        }).filter(account => account !== null);
+
+        if (accounts.length === 0) {
+          console.warn(`Skipping instruction with program ${programId.toBase58()} due to no valid accounts`);
+          continue;
+        }
+
+        const instruction = new TransactionInstruction({
+          keys: accounts,
+          programId,
+          data: Buffer.from(compiledIx.data).slice(0, compiledIx.data.length)
+        });
+        console.log(`Extracted instruction: ProgramID=${programId.toBase58()}, Accounts=${accounts.map(acc => acc.pubkey.toBase58()).join(', ')} (Count: ${accounts.length}), Data=${instruction.data.toString('hex')}`);
+        instructions.push(instruction);
+      }
+    } else {
+      throw new Error('No compiled instructions found in VersionedTransaction');
+    }
+
+    console.log(`Extracted ${instructions.length} instructions from swap transaction`);
+    let minAccountIx = null;
+    let minAccountCount = Infinity;
+    instructions.forEach((ix, idx) => {
+      const accountCount = ix.keys.length;
+      console.log(`Swap Instruction ${idx + 1} Accounts (Count: ${accountCount}):`, ix.keys.map(key => key.pubkey.toBase58()));
+      if (accountCount < minAccountCount) {
+        minAccountCount = accountCount;
+        minAccountIx = ix;
+      }
+    });
+    if (!minAccountIx) throw new Error('No valid swap instruction found');
+    console.log(`Selected swap instruction with ${minAccountCount} accounts`);
+    return [minAccountIx];
+  } catch (error) {
+    console.error(`Swap failed: ${error.message}`, error.response?.data || error.response);
+    throw error;
+  }
+}
+
+// Count unique accounts
+function countUniqueAccounts(instructions) {
+  const uniqueAccounts = new Set();
+  instructions.forEach(ix => ix.keys.forEach(key => uniqueAccounts.add(key.pubkey.toBase58())));
+  const uniqueAccountArray = Array.from(uniqueAccounts).map(pubkey => ({ pubkey: new PublicKey(pubkey), isSigner: false, isWritable: false }));
+  console.log('Unique accounts in transaction:', uniqueAccountArray.map(acc => acc.pubkey.toBase58()));
+  return uniqueAccountArray.length;
+}
+
+// MarginFi Flash Loan (Single Transaction with Direct Arbitrage)
+async function executeMarginFiFlashLoan(client, amountToBorrow, pair, quote1, quote2, maxAccountRetries = 3) {
+  console.log('Executing MarginFi Flash Loan for pair:', pair);
+  console.log('Reusing pre-created MarginFi account:', MARGINFI_ACCOUNT_ADDRESS.toBase58());
+
+  const accountInfo = await connection.getAccountInfo(MARGINFI_ACCOUNT_ADDRESS);
+  if (!accountInfo || !accountInfo.owner.equals(MARGINFI_PROGRAM_ID)) {
+    throw new Error(`Invalid MarginFi account ${MARGINFI_ACCOUNT_ADDRESS.toBase58()} or wrong program ownership`);
+  }
+  console.log('MarginFi Account Data Length:', accountInfo.data.length);
+
+  let marginfiAccount;
+  try {
+    marginfiAccount = await MarginfiAccountWrapper.fetch(MARGINFI_ACCOUNT_ADDRESS, client);
+    if (!marginfiAccount) throw new Error('Failed to fetch MarginFi account');
+    console.log('MarginFi Account Details:', marginfiAccount);
+  } catch (error) {
+    console.error('MarginFi account fetch error:', error.message);
+    throw error;
+  }
+
+  const solBank = client.getBankByTokenSymbol('SOL');
+  if (!solBank) throw new Error('SOL bank not found');
+  console.log('SOL Bank Address:', solBank.address.toBase58());
+  console.log('SOL Bank Liquidity Vault:', solBank.liquidityVault.toBase58());
+  console.log('SOL Bank Oracle Setup:', solBank.config.oracleSetup);
+  console.log('SOL Bank Oracle Keys:', solBank.config.oracleKeys.map(key => key.toBase58()));
+
+  const vaultAccountInfo = await connection.getAccountInfo(solBank.liquidityVault);
+  const availableLiquidity = vaultAccountInfo ? vaultAccountInfo.lamports : 0;
+  console.log('Available Liquidity in Vault (lamports):', availableLiquidity);
+  if (BigInt(amountToBorrow) > BigInt(availableLiquidity)) {
+    throw new Error(`Requested ${amountToBorrow / LAMPORTS_PER_SOL} SOL exceeds available liquidity (${availableLiquidity / LAMPORTS_PER_SOL} SOL)`);
+  }
+
+  const solTokenAccount = new PublicKey('BgJ2EKBmLkBB4jP5A66R6N8FfAqFGvkisLXViBk1rmTE');
+  const usdcTokenAccount = await getSplAssociatedTokenAddress(USDC, wallet.publicKey);
+  const usdtTokenAccount = await getSplAssociatedTokenAddress(USDT, wallet.publicKey);
+
+  const tokenAccounts = [
+    { account: solTokenAccount, mint: SOL },
+    { account: usdcTokenAccount, mint: USDC },
+    { account: usdtTokenAccount, mint: USDT },
+  ];
+  const accountInfos = await Promise.all(tokenAccounts.map(ta => connection.getAccountInfo(ta.account)));
+  for (let i = 0; i < tokenAccounts.length; i++) {
+    const { account, mint } = tokenAccounts[i];
+    const accountInfo = accountInfos[i];
+    if (!accountInfo) {
+      console.log(`Creating ${mint.toBase58().slice(0, 8)}... token account ${account.toBase58()}...`);
+      const initTokenAccountIx = createAssociatedTokenAccountInstruction(
+        wallet.publicKey,
+        account,
+        wallet.publicKey,
+        mint
+      );
+      const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+      const txMessage = new TransactionMessage({
+        payerKey: wallet.publicKey,
+        recentBlockhash: latestBlockhash.blockhash,
+        instructions: [initTokenAccountIx],
+      }).compileToV0Message();
+      const tx = new VersionedTransaction(txMessage);
+      tx.sign([wallet]);
+      const txid = await connection.sendTransaction(tx, { skipPreflight: true, preflightCommitment: 'confirmed' });
+      await connection.confirmTransaction(txid, 'confirmed');
+      console.log(`${mint.toBase58().slice(0, 8)}... token account created: https://solscan.io/tx/${txid}`);
+    } else {
+      console.log(`${mint.toBase58().slice(0, 8)}... token account ${account.toBase58()} already exists`);
+    }
+  }
+
+  const [bankLiquidityVaultAuthority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("liquidity_vault_auth"), solBank.address.toBuffer()],
+    MARGINFI_PROGRAM_ID
+  );
+  const [bankLiquidityVault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("liquidity_vault"), solBank.address.toBuffer()],
+    MARGINFI_PROGRAM_ID
+  );
+
+  const amountBuffer = Buffer.alloc(8);
+  amountBuffer.writeBigUInt64LE(BigInt(amountToBorrow), 0);
+  console.log(`Borrow/Repay Amount: ${amountBuffer.readBigUInt64LE().toString()} lamports (${amountBuffer.readBigUInt64LE().toString() / LAMPORTS_PER_SOL} SOL)`);
+
+  const borrowIx = new TransactionInstruction({
+    keys: [
+      { pubkey: MARGINFI_GROUP_ADDRESS, isSigner: false, isWritable: false },
+      { pubkey: MARGINFI_ACCOUNT_ADDRESS, isSigner: false, isWritable: true },
+      { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
+      { pubkey: solBank.address, isSigner: false, isWritable: true },
+      { pubkey: solTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: bankLiquidityVaultAuthority, isSigner: false, isWritable: true },
+      { pubkey: bankLiquidityVault, isSigner: false, isWritable: true },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    programId: MARGINFI_PROGRAM_ID,
+    data: Buffer.concat([getBorrowDiscriminator(), amountBuffer]),
+  });
+
+  const repayIx = new TransactionInstruction({
+    keys: [
+      { pubkey: MARGINFI_GROUP_ADDRESS, isSigner: false, isWritable: false },
+      { pubkey: MARGINFI_ACCOUNT_ADDRESS, isSigner: false, isWritable: true },
+      { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
+      { pubkey: solBank.address, isSigner: false, isWritable: true },
+      { pubkey: solTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: bankLiquidityVault, isSigner: false, isWritable: true },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    ],
+    programId: MARGINFI_PROGRAM_ID,
+    data: Buffer.concat([getRepayDiscriminator(), amountBuffer, Buffer.from([0])]), // repay_all = false
+  });
+
+  // Fetch the SOL bank's price oracle account
+  const solBankOracle = solBank.config.oracleKeys[0]; // Typically, the first key is the primary oracle (e.g., Pyth)
+
+  const endFlashIx = new TransactionInstruction({
+    keys: [
+      { pubkey: MARGINFI_ACCOUNT_ADDRESS, isSigner: false, isWritable: true },
+      { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
+      // Add remaining accounts for each balance
+      // For SOL balance: SOL bank and its oracle
+      { pubkey: solBank.address, isSigner: false, isWritable: false }, // SOL bank
+      { pubkey: solBankOracle, isSigner: false, isWritable: false },  // SOL bank's price oracle
+    ],
+    programId: MARGINFI_PROGRAM_ID,
+    data: Buffer.concat([getEndFlashDiscriminator()]),
+  });
+
+  console.log(`Executing arbitrage for pair: ${pair}`);
+  let swap1Instructions, swap2Instructions;
+  let attempt = 0;
+  let maxAccounts = 25;
+  const maxAccountsPerSwap = 10;
+
+  while (attempt < maxAccountRetries) {
+    attempt++;
+    console.log(`Attempt ${attempt}/${maxAccountRetries} to fetch swaps with <= ${maxAccounts} total accounts`);
+
+    swap1Instructions = await executeJupiterSwap(quote1);
+    swap2Instructions = await executeJupiterSwap(quote2);
+
+    if (swap1Instructions[0].keys.length > maxAccountsPerSwap || swap2Instructions[0].keys.length > maxAccountsPerSwap) {
+      console.warn(`Swap instructions exceed ${maxAccountsPerSwap} accounts per instruction (swap1: ${swap1Instructions[0].keys.length}, swap2: ${swap2Instructions[0].keys.length}), retrying with new quote...`);
+      quote1 = await getJupiterQuote(SOL, pair === 'SOL/USDC' ? USDC : USDT, amountToBorrow, 3, 25);
+      const tokenOut = parseInt(quote1.outAmount);
+      quote2 = await getJupiterQuote(pair === 'SOL/USDC' ? USDC : USDT, SOL, tokenOut, 3, 25);
+      continue;
+    }
+
+    const tempInstructions = [
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500000 }),
+      borrowIx,
+      ...swap1Instructions,
+      ...swap2Instructions,
+    ];
+    const tempAccountCount = countUniqueAccounts(tempInstructions);
+    console.log(`Attempt ${attempt}: Total unique accounts with swaps: ${tempAccountCount}`);
+
+    if (tempAccountCount <= maxAccounts) {
+      console.log(`Swap instructions meet account limit (${tempAccountCount} <= ${maxAccounts})`);
+      break;
+    } else {
+      console.warn(`Too many accounts (${tempAccountCount} > ${maxAccounts}), retrying with new quote...`);
+      quote1 = await getJupiterQuote(SOL, pair === 'SOL/USDC' ? USDC : USDT, amountToBorrow, 3, 25);
+      const tokenOut = parseInt(quote1.outAmount);
+      quote2 = await getJupiterQuote(pair === 'SOL/USDC' ? USDC : USDT, SOL, tokenOut, 3, 25);
+    }
+    await sleep(1000);
+  }
+
+  if (attempt >= maxAccountRetries) {
+    throw new Error(`Failed to fetch swaps with <= ${maxAccounts} accounts after ${maxAccountRetries} attempts`);
+  }
+
+  // Construct the full transaction instructions first
+  const allInstructions = [
+    ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 500000 }),
+    // startFlashIx will be added here after calculating endIndex
+    borrowIx,
+    ...swap1Instructions,
+    ...swap2Instructions,
+    repayIx,
+    endFlashIx,
+  ];
+
+  // Calculate endIndex based on the total number of instructions
+  const endIndex = allInstructions.length; // This should be 7 (ComputeBudget + startFlashIx + borrowIx + swap1 + swap2 + repayIx + endFlashIx)
+  console.log(`Calculated end_index for endFlashIx: ${endIndex}`);
+
+  const endIndexBuffer = Buffer.alloc(8);
+  endIndexBuffer.writeBigUInt64LE(BigInt(endIndex), 0);
+
+  const startFlashIx = new TransactionInstruction({
+    keys: [
+      { pubkey: MARGINFI_ACCOUNT_ADDRESS, isSigner: false, isWritable: true },
+      { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
+      { pubkey: SYSVAR_INSTRUCTIONS, isSigner: false, isWritable: false },
+    ],
+    programId: MARGINFI_PROGRAM_ID,
+    data: Buffer.concat([getStartFlashDiscriminator(), endIndexBuffer]),
+  });
+
+  // Insert startFlashIx into the instructions array at the correct position (after ComputeBudget)
+  allInstructions.splice(1, 0, startFlashIx);
+
+  const uniqueAccounts = new Set();
+  const deduplicatedInstructions = allInstructions.map(ix => {
+    const newKeys = [];
+    const localKeys = new Set();
+    for (const key of ix.keys) {
+      const keyStr = key.pubkey.toBase58();
+      if (key.isSigner || key.isWritable || key.pubkey.equals(SYSVAR_INSTRUCTIONS)) {
+        newKeys.push(key);
+        uniqueAccounts.add(keyStr);
+      } else {
+        if (!localKeys.has(keyStr)) {
+          newKeys.push(key);
+          localKeys.add(keyStr);
+          uniqueAccounts.add(keyStr);
+        }
+      }
+    }
+    return { ...ix, keys: newKeys };
+  });
+
+  const finalAccountCount = countUniqueAccounts(deduplicatedInstructions);
+  console.log(`Single Tx after deduplication: ${deduplicatedInstructions.length} instructions, ${finalAccountCount} accounts`);
+
+  deduplicatedInstructions.forEach((ix, idx) => {
+    console.log(`Instruction ${idx + 1} (Program: ${ix.programId.toBase58()}):`);
+    console.log(`  Accounts: ${ix.keys.map(k => `${k.pubkey.toBase58()} (signer: ${k.isSigner}, writable: ${k.isWritable})`).join(', ')}`);
+    console.log(`  Data: ${ix.data.toString('hex')}`);
+  });
+
+  const txMessage = new TransactionMessage({
+    payerKey: wallet.publicKey,
+    recentBlockhash: (await connection.getLatestBlockhash('confirmed')).blockhash,
+    instructions: deduplicatedInstructions,
+  }).compileToV0Message();
+  const tx = new VersionedTransaction(txMessage);
+  tx.sign([wallet]);
+  const txSize = tx.serialize().length;
+  console.log(`Single Tx Size: ${txSize} bytes`);
+  if (txSize > 1232) throw new Error('Transaction too large');
+
+  let txid;
+  let confirmed = false;
+  for (let retry = 0; retry < 3; retry++) {
+    try {
+      txid = await connection.sendTransaction(tx, { skipPreflight: true, preflightCommitment: 'confirmed' });
+      console.log(`Transaction sent (Attempt ${retry + 1}): https://solscan.io/tx/${txid}`);
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+      confirmed = await connection.confirmTransaction({
+        signature: txid,
+        blockhash,
+        lastValidBlockHeight,
+      }, 'confirmed', 60000);
+      if (confirmed.value.err) throw new Error(`Transaction failed: ${confirmed.value.err}`);
+      break;
+    } catch (error) {
+      console.error(`Transaction attempt ${retry + 1} failed: ${error.message}`);
+      if (retry === 2) {
+        console.error('All retry attempts failed, switching RPC...');
+        switchRpc();
+      }
+      await sleep(2000);
+    }
+  }
+
+  if (confirmed) {
+    console.log(`Tx Success: https://solscan.io/tx/${txid}`);
+    const solBack = parseInt(quote2.outAmount);
+    const netProfit = solBack - amountToBorrow;
+    console.log(`Net profit after flash loan: ${netProfit / LAMPORTS_PER_SOL} SOL`);
+    return netProfit > 0 ? netProfit : 0;
+  } else {
+    throw new Error(`Transaction not confirmed after retries. Check signature ${txid} on Solscan.`);
+  }
+}
+
+// MEV Bot Main Loop
+async function mevBot() {
+  console.log('Running MEV bot with Jupiter and MarginFi Flash Loan (SOL/USDC, SOL/USDT arbitrage)');
+  console.log('Wallet Public Key:', wallet.publicKey.toBase58());
+
+  const nodeWallet = new NodeWallet(wallet);
+  let client;
+  for (let i = 0; i < 3; i++) {
+    try {
+      client = await MarginfiClient.fetch(getConfig('production'), nodeWallet, connection);
+      console.log('MarginFi client initialized successfully');
+      break;
+    } catch (error) {
+      console.error(`Attempt ${i + 1} failed: ${error.message}`);
+      if (i === 2) {
+        console.error('Failed to initialize MarginFi client after 3 retries');
+        switchRpc();
+        return;
+      }
+      await sleep(5000);
+    }
+  }
+
+  while (true) {
+    try {
+      const flashLoanAmount = 500000000000;
+      const solBalance = await connection.getBalance(wallet.publicKey);
+      console.log(`Current SOL Balance: ${solBalance / LAMPORTS_PER_SOL} SOL`);
+
+      if (solBalance < 2500000) {
+        console.error('Insufficient SOL balance for fees. Need at least 0.0025 SOL.');
+        break;
+      }
+
+      const pairs = [
+        { name: 'SOL/USDC', token: USDC },
+        { name: 'SOL/USDT', token: USDT },
+      ];
+
+      let bestPair = null;
+      let bestProfit = 0;
+      let bestQuotes = {};
+
+      for (const pair of pairs) {
+        try {
+          const quote1 = await getJupiterQuote(SOL, pair.token, flashLoanAmount);
+          const tokenOut = parseInt(quote1.outAmount);
+          await sleep(1000);
+
+          const quote2 = await getJupiterQuote(pair.token, SOL, tokenOut);
+          const solBack = parseInt(quote2.outAmount);
+          const profit = solBack - flashLoanAmount;
+
+          console.log(`${pair.name} Profit: ${profit / LAMPORTS_PER_SOL} SOL`);
+
+          if (profit > bestProfit) {
+            bestProfit = profit;
+            bestPair = pair.name;
+            bestQuotes = { quote1, quote2 };
+          }
+        } catch (error) {
+          console.error(`Failed to evaluate ${pair.name}: ${error.message}`);
+        }
+        await sleep(1000);
+      }
+
+      const minProfit = 1500000;
+      if (!bestPair || bestProfit <= minProfit) {
+        console.log(`No profitable arbitrage opportunity found. Best Profit: ${bestProfit / LAMPORTS_PER_SOL} SOL`);
+        await sleep(5000);
+        continue;
+      }
+
+      console.log(`Arbitrage opportunity found! Pair: ${bestPair}, Potential Profit: ${bestProfit / LAMPORTS_PER_SOL} SOL`);
+      const netProfit = await executeMarginFiFlashLoan(client, flashLoanAmount, bestPair, bestQuotes.quote1, bestQuotes.quote2);
+      if (netProfit > 0) console.log(`Net profit after flash loan: ${netProfit / LAMPORTS_PER_SOL} SOL`);
+    } catch (err) {
+      console.error('Error during MEV bot execution:', err.message);
+    }
+    await sleep(5000);
+  }
+}
+
+// Run the bot
+mevBot().catch(console.error);
+
+
+
+
+
+
+
+kamino flashloan:
+
+
+require('dotenv').config({ path: '/home/yonaszenebe43/solana-mev-bot/.env' });
+const { Connection, Keypair, VersionedTransaction, TransactionInstruction, PublicKey, LAMPORTS_PER_SOL, TransactionMessage, AddressLookupTableAccount, SystemProgram, sendAndConfirmTransaction } = require('@solana/web3.js');
+const { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, TOKEN_PROGRAM_ID, getAccount } = require('@solana/spl-token');
+const axios = require('axios');
+const bs58 = require('bs58');
+const { createHash } = require('crypto');
+
+const privateKeyEnv = process.env.PRIVATE_KEY;
+if (!privateKeyEnv) throw new Error('Private key not found in environment variables.');
+
+let wallet;
+try {
+  const secretKeyBuffer = bs58.decode(privateKeyEnv);
+  if (secretKeyBuffer.length !== 64) throw new Error('Base58-decoded key must be 64 bytes long.');
+  wallet = Keypair.fromSecretKey(secretKeyBuffer);
+} catch (error) {
+  throw new Error(`Failed to parse private key: ${error.message}. Ensure it’s a base58-encoded keypair (88 characters) in .env.`);
+}
+
+const primaryConnection = new Connection('https://mainnet.helius-rpc.com/?api-key=62802680-f5c5-4418-b266-43eb2c694dbe', 'confirmed');
+const fallbackConnection = new Connection('https://solana-api.instantnodes.io/token-11NFu03WnNUOfCb1QP2LP53nAHgauXxA', 'confirmed');
+let currentConnection = primaryConnection;
+
+const SOL = new PublicKey('So11111111111111111111111111111111111111112');
+const USDC = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+const KAMINO_LENDING_PROGRAM = new PublicKey('KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD');
+const SOL_RESERVE_ADDRESS = new PublicKey('6gTJfuPHEg6uRAijRkMqNc9kan4sVZejKMxmvx2grT1p');
+const SOL_SUPPLY_VAULT = new PublicKey('ywaaLvG7t1vXJo8sT3UzE8yzzZtxLM7Fmev64Jbooye');
+const COMPUTE_BUDGET_PROGRAM = new PublicKey('ComputeBudget111111111111111111111111111111');
+const KAMINO_MARKET_ADDRESS = new PublicKey('H6rHXmXoCQvq8Ue81MqNh7ow5ysPa1dSozwW3PU1dDH6');
+const TOKEN_PROGRAM_ID_PUBKEY = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const SYSVAR_INSTRUCTIONS_PUBKEY = new PublicKey('Sysvar1nstructions1111111111111111111111111');
+const SYSVAR_RENT_PUBKEY = new PublicKey('SysvarRent111111111111111111111111111111111');
+const FLASH_LOAN_FEE = 0.00001; // 0.001% fee in decimal form
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function switchConnection() {
+  currentConnection = (currentConnection === primaryConnection) ? fallbackConnection : primaryConnection;
+  console.log(`Switched to RPC: ${currentConnection.rpcEndpoint}`);
+}
+
+async function retryOperation(operation, retries = 10, delay = 3000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const result = await operation(currentConnection);
+      if (result) return result;
+    } catch (error) {
+      console.error(`Attempt ${i + 1} failed: ${error.message}`);
+      if (i === retries - 1) {
+        console.log('Switching RPC due to repeated failures...');
+        switchConnection();
+        throw new Error(`All retries failed: ${error.message}`);
+      }
+      await sleep(delay);
+    }
+  }
+}
+
+async function getOrCreateWsolAta() {
+  const wsolAta = await getAssociatedTokenAddress(SOL, wallet.publicKey, false, TOKEN_PROGRAM_ID_PUBKEY);
+  const accountInfo = await currentConnection.getAccountInfo(wsolAta);
+  if (!accountInfo) {
+    console.log(`Creating WSOL ATA: ${wsolAta.toBase58()}`);
+    const transaction = new VersionedTransaction(new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: (await currentConnection.getLatestBlockhash('confirmed')).blockhash,
+      instructions: [createAssociatedTokenAccountInstruction(wallet.publicKey, wsolAta, wallet.publicKey, SOL, TOKEN_PROGRAM_ID_PUBKEY)],
+    }).compileToV0Message());
+    transaction.sign([wallet]);
+    const signature = await sendAndConfirmTransaction(currentConnection, transaction);
+    console.log(`WSOL ATA created: ${signature}`);
+  }
+  return wsolAta;
+}
+
+async function getOrCreateUsdcAta() {
+  const usdcAta = await getAssociatedTokenAddress(USDC, wallet.publicKey, false, TOKEN_PROGRAM_ID_PUBKEY);
+  const accountInfo = await currentConnection.getAccountInfo(usdcAta);
+  if (!accountInfo) {
+    console.log(`Creating USDC ATA: ${usdcAta.toBase58()}`);
+    const transaction = new VersionedTransaction(new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: (await currentConnection.getLatestBlockhash('confirmed')).blockhash,
+      instructions: [createAssociatedTokenAccountInstruction(wallet.publicKey, usdcAta, wallet.publicKey, USDC, TOKEN_PROGRAM_ID_PUBKEY)],
+    }).compileToV0Message());
+    transaction.sign([wallet]);
+    const signature = await sendAndConfirmTransaction(currentConnection, transaction);
+    console.log(`USDC ATA created: ${signature}`);
+  }
+  return usdcAta;
+}
+
+async function getJupiterQuote(inputMint, outputMint, amount, maxAttempts = 3, initialSlippageBps = 200) { // Reverted to original slippage
+  let slippageBps = initialSlippageBps;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const url = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}&onlyDirectRoutes=true`;
+    console.log(`Fetching quote (Attempt ${attempt}/${maxAttempts}) with slippage ${slippageBps} bps from: ${url}`);
+    try {
+      const response = await axios.get(url);
+      console.log(`Quote response:`, response.data);
+      if (!response.data.outAmount) throw new Error('Invalid quote response: outAmount missing');
+      console.log(`Quote successful with slippage ${slippageBps} bps`);
+      return { ...response.data, slippageBps };
+    } catch (error) {
+      if (attempt === maxAttempts) throw new Error(`Jupiter API error after ${maxAttempts} attempts: ${error.message} - Status: ${error.response?.status}`);
+      console.warn(`Quote failed, increasing slippage to ${slippageBps * 1.5} bps and retrying...`);
+      slippageBps = Math.min(Math.floor(slippageBps * 1.5), 3000); // Reverted to original max slippage
+      await sleep(1000);
+    }
+  }
+}
+
+async function getJupiterSwapInstructions(quoteResponse, destination) {
+  const swapUrl = 'https://quote-api.jup.ag/v6/swap-instructions';
+  try {
+    const { data } = await axios.post(swapUrl, {
+      quoteResponse,
+      userPublicKey: wallet.publicKey.toString(),
+      destinationTokenAccount: destination.toString(),
+      wrapAndUnwrapSol: true,
+    });
+    return data;
+  } catch (error) {
+    console.error(`Swap instructions error: ${error.message}`);
+    throw error;
+  }
+}
+
+async function fetchLookupTableAccounts(lookupTableAddresses) {
+  const lookupTables = [];
+  for (const address of lookupTableAddresses) {
+    const accountInfo = await retryOperation(c => c.getAccountInfo(address));
+    if (!accountInfo) throw new Error(`Failed to fetch lookup table: ${address.toBase58()}`);
+    const addresses = [];
+    const data = accountInfo.data;
+    const numAddresses = data.readUInt32LE(52);
+    for (let i = 0; i < numAddresses && (56 + i * 32) < data.length; i++) {
+      addresses.push(new PublicKey(data.slice(56 + i * 32, 56 + (i + 1) * 32)));
+    }
+    lookupTables.push(new AddressLookupTableAccount({
+      key: address,
+      state: { addresses, deactivationSlot: BigInt(0), lastExtendedSlot: 0, lastExtendedSlotStartIndex: 0 },
+    }));
+  }
+  return lookupTables;
+}
+
+function deduplicateInstructions(instructions) {
+  const seen = new Set();
+  let computePriceIx = null;
+  const deduped = [];
+
+  for (const ix of instructions) {
+    const key = `${ix.programId.toBase58()}-${ix.data.toString('base64')}`;
+    const isComputeBudget = ix.programId.equals(COMPUTE_BUDGET_PROGRAM);
+    const isSetComputeUnitPrice = isComputeBudget && ix.data[0] === 3;
+
+    if (isSetComputeUnitPrice) {
+      if (!computePriceIx) {
+        computePriceIx = ix;
+        deduped.push(ix);
+      } else {
+        const currentPrice = Buffer.from(ix.data).readBigUInt64LE(1);
+        const keptPrice = Buffer.from(computePriceIx.data).readBigUInt64LE(1);
+        if (currentPrice > keptPrice) {
+          deduped[deduped.indexOf(computePriceIx)] = ix;
+          computePriceIx = ix;
+        }
+      }
+    } else if (!seen.has(key)) {
+      seen.add(key);
+      deduped.push(ix);
+    }
+  }
+
+  if (!computePriceIx) {
+    const microLamportsPerCU = BigInt(Math.floor((0.0005 * LAMPORTS_PER_SOL) / 1_000_000));
+    const buffer = Buffer.alloc(9);
+    buffer.writeUInt8(3, 0);
+    buffer.writeBigUInt64LE(microLamportsPerCU, 1);
+    deduped.unshift(new TransactionInstruction({
+      programId: COMPUTE_BUDGET_PROGRAM,
+      keys: [],
+      data: buffer,
+    }));
+  }
+
+  return deduped;
+}
+
+function getBorrowDiscriminator() {
+  const hash = createHash('sha256').update('global:flash_borrow_reserve_liquidity').digest();
+  return hash.slice(0, 8);
+}
+
+function getRepayDiscriminator() {
+  const hash = createHash('sha256').update('global:flash_repay_reserve_liquidity').digest();
+  return hash.slice(0, 8);
+}
+
+function getInitReferrerDiscriminator() {
+  const hash = createHash('sha256').update('global:init_referrer_token_state').digest();
+  return hash.slice(0, 8);
+}
+
+async function initializeReferrerTokenState() {
+  const referrerTokenState = new PublicKey('KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD');
+  const accountInfo = await currentConnection.getAccountInfo(referrerTokenState);
+  if (!accountInfo) {
+    const initIx = new TransactionInstruction({
+      programId: KAMINO_LENDING_PROGRAM,
+      keys: [
+        { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
+        { pubkey: KAMINO_MARKET_ADDRESS, isSigner: false, isWritable: false },
+        { pubkey: SOL_RESERVE_ADDRESS, isSigner: false, isWritable: false },
+        { pubkey: wallet.publicKey, isSigner: false, isWritable: false },
+        { pubkey: referrerTokenState, isSigner: false, isWritable: true },
+        { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: getInitReferrerDiscriminator(),
+    });
+    const transaction = new VersionedTransaction(new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: (await currentConnection.getLatestBlockhash('confirmed')).blockhash,
+      instructions: [initIx],
+    }).compileToV0Message());
+    transaction.sign([wallet]);
+    const signature = await sendAndConfirmTransaction(currentConnection, transaction);
+    console.log(`ReferrerTokenState initialized: ${signature}`);
+  }
+  return referrerTokenState;
+}
+
+async function executeKaminoFlashLoan(amountToBorrow, quote1, quote2, maxSlippageRetries = 2) {
+  const flashLoanFee = BigInt(Math.floor(Number(amountToBorrow) * FLASH_LOAN_FEE)); // 0.001% fee
+  const amountToRepay = BigInt(amountToBorrow) + flashLoanFee; // Exact repayment amount including fee
+  const referrerTokenState = await initializeReferrerTokenState();
+  const wsolAta = await getOrCreateWsolAta();
+  const usdcAta = await getOrCreateUsdcAta();
+  const lendingMarketAuthority = new PublicKey('Dx8iy2o46sK1DzWbEcznqSKeLbLVeu7otkibA3WohGAj');
+  const reserveLiquidityFeeReceiver = new PublicKey('EQ7hw63aBS7aPQqXsoxaaBxiwbEzaAiY9Js6tCekkqxf');
+
+  console.log('Debug: Checking token account balances before swap...');
+  const wsolAccountInfo = await getAccount(currentConnection, wsolAta);
+  const usdcAccountInfo = await getAccount(currentConnection, usdcAta);
+
+  const wsolBalance = Number(wsolAccountInfo.amount) / LAMPORTS_PER_SOL;
+  const usdcBalance = Number(usdcAccountInfo.amount) / 1_000_000;
+  console.log(`WSOL ATA (${wsolAta.toBase58()}) balance: ${wsolBalance} WSOL`);
+  console.log(`USDC ATA (${usdcAta.toBase58()}) balance: ${usdcBalance} USDC`);
+
+  const borrowAmountBuffer = Buffer.alloc(8);
+  borrowAmountBuffer.writeBigUInt64LE(amountToBorrow);
+  const borrowData = Buffer.concat([getBorrowDiscriminator(), borrowAmountBuffer]);
+
+  const repayAmountBuffer = Buffer.alloc(8);
+  repayAmountBuffer.writeBigUInt64LE(amountToRepay);
+  const repayData = Buffer.concat([getRepayDiscriminator(), repayAmountBuffer, Buffer.from([0])]);
+
+  let attempt = 0;
+  let adjustedQuote1 = quote1;
+  let adjustedQuote2 = quote2;
+  let currentSlippageBps = adjustedQuote1.slippageBps;
+
+  while (attempt < maxSlippageRetries) {
+    attempt++;
+    console.log(`Slippage retry attempt ${attempt}/${maxSlippageRetries} with slippage ${currentSlippageBps} bps...`);
+
+    const borrowIx = new TransactionInstruction({
+      programId: KAMINO_LENDING_PROGRAM,
+      keys: [
+        { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
+        { pubkey: lendingMarketAuthority, isSigner: false, isWritable: false },
+        { pubkey: KAMINO_MARKET_ADDRESS, isSigner: false, isWritable: false },
+        { pubkey: SOL_RESERVE_ADDRESS, isSigner: false, isWritable: true },
+        { pubkey: SOL, isSigner: false, isWritable: false },
+        { pubkey: SOL_SUPPLY_VAULT, isSigner: false, isWritable: true },
+        { pubkey: wsolAta, isSigner: false, isWritable: true },
+        { pubkey: reserveLiquidityFeeReceiver, isSigner: false, isWritable: true },
+        { pubkey: referrerTokenState, isSigner: false, isWritable: true },
+        { pubkey: referrerTokenState, isSigner: false, isWritable: true },
+        { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_PROGRAM_ID_PUBKEY, isSigner: false, isWritable: false },
+      ],
+      data: borrowData,
+    });
+
+    const swap1InstructionsResponse = await retryOperation(() => getJupiterSwapInstructions(adjustedQuote1, usdcAta));
+    const instructions = [borrowIx];
+    const addSwapInstructions = (response) => {
+      if (response.computeBudgetInstructions) {
+        instructions.push(...response.computeBudgetInstructions.map(ix => new TransactionInstruction({
+          programId: new PublicKey(ix.programId),
+          keys: ix.accounts.map(acc => ({ pubkey: new PublicKey(acc.pubkey), isSigner: acc.isSigner, isWritable: acc.isWritable })),
+          data: Buffer.from(ix.data, 'base64'),
+        })));
+      }
+      instructions.push(new TransactionInstruction({
+        programId: new PublicKey(response.swapInstruction.programId),
+        keys: response.swapInstruction.accounts.map(acc => ({ pubkey: new PublicKey(acc.pubkey), isSigner: acc.isSigner, isWritable: acc.isWritable })),
+        data: Buffer.from(response.swapInstruction.data, 'base64'),
+      }));
+    };
+    addSwapInstructions(swap1InstructionsResponse);
+
+    const expectedUsdcAfterSwap1 = Number(adjustedQuote1.outAmount) / 1_000_000;
+    console.log(`Expected USDC after first swap: ${expectedUsdcAfterSwap1} USDC`);
+
+    const usdcAmountForSwap2 = adjustedQuote1.outAmount;
+    adjustedQuote2 = await retryOperation(() => getJupiterQuote(USDC, SOL, usdcAmountForSwap2, 3, currentSlippageBps));
+    if (!adjustedQuote2) {
+      throw new Error('Failed to get USDC -> SOL quote');
+    }
+    const swap2InstructionsResponse = await retryOperation(() => getJupiterSwapInstructions(adjustedQuote2, wsolAta));
+    addSwapInstructions(swap2InstructionsResponse);
+
+    const repayIx = new TransactionInstruction({
+      programId: KAMINO_LENDING_PROGRAM,
+      keys: [
+        { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
+        { pubkey: lendingMarketAuthority, isSigner: false, isWritable: false },
+        { pubkey: KAMINO_MARKET_ADDRESS, isSigner: false, isWritable: false },
+        { pubkey: SOL_RESERVE_ADDRESS, isSigner: false, isWritable: true },
+        { pubkey: SOL, isSigner: false, isWritable: false },
+        { pubkey: SOL_SUPPLY_VAULT, isSigner: false, isWritable: true },
+        { pubkey: wsolAta, isSigner: false, isWritable: true },
+        { pubkey: reserveLiquidityFeeReceiver, isSigner: false, isWritable: true },
+        { pubkey: referrerTokenState, isSigner: false, isWritable: true },
+        { pubkey: referrerTokenState, isSigner: false, isWritable: true },
+        { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_PROGRAM_ID_PUBKEY, isSigner: false, isWritable: false },
+      ],
+      data: repayData,
+    });
+    instructions.push(repayIx);
+
+    const lookupTableAddresses = [
+      ...new Set([...(swap1InstructionsResponse.addressLookupTableAddresses || []), ...(swap2InstructionsResponse.addressLookupTableAddresses || [])].map(addr => new PublicKey(addr))),
+    ];
+    const lookupTableAccounts = await fetchLookupTableAccounts(lookupTableAddresses);
+    const deduplicatedInstructions = deduplicateInstructions(instructions);
+
+    const { blockhash, lastValidBlockHeight } = await currentConnection.getLatestBlockhash('confirmed');
+    const tx = new VersionedTransaction(new TransactionMessage({
+      payerKey: wallet.publicKey,
+      recentBlockhash: blockhash,
+      instructions: deduplicatedInstructions,
+    }).compileToV0Message(lookupTableAccounts));
+    tx.sign([wallet]);
+
+    const txSize = tx.serialize().length;
+    console.log(`Transaction size: ${txSize} bytes`);
+    if (txSize > 1232) throw new Error(`Transaction too large: ${txSize} bytes`);
+
+    try {
+      const signature = await currentConnection.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 10 });
+      console.log(`Transaction submitted: ${signature}`);
+      await currentConnection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed');
+
+      const solBack = BigInt(adjustedQuote2.outAmount);
+      const networkFee = BigInt(5000);
+      const netProfit = solBack - amountToRepay - networkFee;
+      console.log(`Flash Loan Fee (0.001%): ${Number(flashLoanFee) / LAMPORTS_PER_SOL} SOL`);
+      console.log(`Final Profit after fee: ${Number(netProfit) / LAMPORTS_PER_SOL} SOL`);
+      return netProfit > 0n ? netProfit : 0n;
+    } catch (error) {
+      console.error(`Transaction failed: ${error.message}`);
+      if (attempt === maxSlippageRetries) throw new Error(`Transaction failed after ${maxSlippageRetries} slippage retries: ${error.message}`);
+      console.warn(`Likely slippage issue, increasing slippage to ${currentSlippageBps * 1.5} bps and retrying...`);
+      currentSlippageBps = Math.min(Math.floor(currentSlippageBps * 1.5), 3000);
+      adjustedQuote1 = await retryOperation(() => getJupiterQuote(SOL, USDC, amountToBorrow.toString(), 3, currentSlippageBps));
+    }
+  }
+
+  throw new Error(`Failed to execute transaction after ${maxSlippageRetries} slippage retries`);
+}
+
+async function mevBot() {
+  console.log('Starting MEV bot with Kamino Finance (500 SOL, min profit 0.01 SOL)...');
+  await getOrCreateWsolAta();
+  await getOrCreateUsdcAta();
+
+  const flashLoanAmount = BigInt(500 * LAMPORTS_PER_SOL);
+  const minProfit = BigInt(Math.floor(0.01 * LAMPORTS_PER_SOL));
+
+  while (true) {
+    try {
+      const solBalance = BigInt(await currentConnection.getBalance(wallet.publicKey));
+      console.log(`Balance: ${Number(solBalance) / LAMPORTS_PER_SOL} SOL`);
+      if (solBalance < BigInt(5000000)) {
+        console.error('Insufficient SOL for fees.');
+        break;
+      }
+
+      const quote1 = await retryOperation(() => getJupiterQuote(SOL, USDC, flashLoanAmount.toString()));
+      if (!quote1) {
+        console.log('Failed to get SOL -> USDC quote, skipping...');
+        await sleep(2000);
+        continue;
+      }
+      const midOut = BigInt(quote1.outAmount);
+
+      const quote2 = await retryOperation(() => getJupiterQuote(USDC, SOL, midOut.toString()));
+      if (!quote2) {
+        console.log('Failed to get USDC -> SOL quote, skipping...');
+        await sleep(2000);
+        continue;
+      }
+      const solBack = BigInt(quote2.outAmount);
+      const flashLoanFee = BigInt(Math.floor(Number(flashLoanAmount) * FLASH_LOAN_FEE)); // 0.001% fee
+      const amountToRepay = flashLoanAmount + flashLoanFee;
+      const networkFee = BigInt(5000);
+      const netProfit = solBack - amountToRepay - networkFee;
+
+      console.log(`Potential Profit after 0.001% fee: ${Number(netProfit) / LAMPORTS_PER_SOL} SOL`);
+      if (netProfit > minProfit) {
+        console.log(`Profitable trade found! Executing flash loan for ${Number(netProfit) / LAMPORTS_PER_SOL} SOL profit...`);
+        const finalProfit = await executeKaminoFlashLoan(flashLoanAmount, quote1, quote2);
+        console.log(`Trade completed with profit: ${Number(finalProfit) / LAMPORTS_PER_SOL} SOL`);
+      } else {
+        console.log(`Profit (${Number(netProfit) / LAMPORTS_PER_SOL} SOL) below 0.01 SOL threshold, skipping...`);
+      }
+    } catch (err) {
+      console.error('Error in MEV loop:', err);
+      if (err && err.message && err.message.includes('All retries failed')) switchConnection();
+    }
+    await sleep(2000);
+  }
+}
+
+mevBot().catch(err => console.error('MEV bot crashed:', err));
+
+
+
+
+
+
+
+
